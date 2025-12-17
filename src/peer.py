@@ -102,7 +102,8 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     global g_received_chunks, g_download_chunks, g_sender_info, g_context
     global g_download_state, g_upload_state, g_window_data
     
-    packet, from_addr = sock.recvfrom(MAX_PAYLOAD + HEADER_LEN)
+    # packet, from_addr = sock.recvfrom(MAX_PAYLOAD + HEADER_LEN)
+    packet, from_addr = sock.recvfrom(1440)
     parsed = parse_packet(packet)
     if not parsed:
         return
@@ -275,8 +276,8 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 sample_rtt = time.time() - state["send_times"][ack_num]
             
             if sample_rtt is not None:
-                alpha = 0.125
-                beta = 0.25
+                alpha = 0.15
+                beta = 0.3
                 state["estimated_rtt"] = (1 - alpha) * state["estimated_rtt"] + alpha * sample_rtt
                 state["dev_rtt"] = (1 - beta) * state["dev_rtt"] + beta * abs(sample_rtt - state["estimated_rtt"])
                 state["timeout"] = max(state["estimated_rtt"] + 4 * state["dev_rtt"], 0.5)
