@@ -81,7 +81,7 @@ def initiate_chunk_download(chunk_hash: str, from_addr: tuple, sock: simsocket.S
         "received_data": {},
         "addr": from_addr,
         "finished": False,
-        "last_received_time": time.time(),
+        "last_received_time": None,
     }
     get_payload = bytes.fromhex(chunk_hash)
     get_pkt = make_packet(PktType.GET, 0, 0, get_payload)
@@ -171,7 +171,6 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     global g_received_chunks, g_download_chunks, g_sender_info, g_context
     global g_download_state, g_upload_state, g_window_data
     
-    # packet, from_addr = sock.recvfrom(MAX_PAYLOAD + HEADER_LEN)
     try:
         packet, from_addr = sock.recvfrom(1440)
     except socket.error:
@@ -243,7 +242,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                     "ssthresh": 64.0,
                     "last_ack_received": 0,
                     "send_times": {},
-                    "timeout": 0.5,
+                    "timeout": 2.0,
                     "estimated_rtt": 0.1,
                     "dev_rtt": 0.05,
                     "dup_acks": {},
@@ -266,7 +265,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             state["dup_acks"] = {}
             state["active"] = True
             state["in_fast_recovery"] = False
-            state["timeout"] = 0.5
+            state["timeout"] = 2.0
             
             # Send first packet
             first_payload = chunk_data[0:MAX_PAYLOAD]
@@ -355,7 +354,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 beta = 0.3
                 state["estimated_rtt"] = (1 - alpha) * state["estimated_rtt"] + alpha * sample_rtt
                 state["dev_rtt"] = (1 - beta) * state["dev_rtt"] + beta * abs(sample_rtt - state["estimated_rtt"])
-                state["timeout"] = max(state["estimated_rtt"] + 4 * state["dev_rtt"], 0.2)
+                state["timeout"] = max(state["estimated_rtt"] + 4 * state["dev_rtt"], 1.0)
             
             state["last_ack_received"] = ack_num
             state["dup_acks"] = {}
@@ -494,27 +493,22 @@ def peer_run(context: PeerContext) -> None:
                         if peer_addr in g_window_data:
                             g_window_data[peer_addr]["cwnd_history"].append(state["cwnd"])
                             g_window_data[peer_addr]["time_history"].append(time.time())
+                
 
                 send_pending_packets(sock, peer_addr, state)
 
-            # 检查下载超时,如果超过5秒未收到数据,重新发送WHOHAS
             for chunk_hash, state in list(g_download_state.items()):
                 if not state["finished"]:
-                    last_time = state.get("last_received_time", 0)
-                    if current_time - last_time > 5.0:
-                        # 超时,重新寻找发送者
+                    last_time = state.get("last_received_time")
+                    if last_time is not None and current_time - last_time > 3.0:
                         if chunk_hash in g_sender_info:
                             del g_sender_info[chunk_hash]
-                        
+                        del g_download_state[chunk_hash]
                         sender = state.get("addr")
                         if sender and g_active_download_by_peer.get(sender) == chunk_hash:
                             del g_active_download_by_peer[sender]
-                            start_next_pending(sender, sock)
-                        
-                        # 重置下载状态
-                        state["last_received_time"] = current_time
-                        
-                        # 重新发送WHOHAS
+                            if sender:
+                                start_next_pending(sender, sock)
                         whohas_hashes = bytes.fromhex(chunk_hash)
                         whohas_payload = struct.pack("B", 1) + whohas_hashes
                         whohas_pkt = make_packet(PktType.WHOHAS, 0, 0, whohas_payload)
@@ -527,26 +521,21 @@ def peer_run(context: PeerContext) -> None:
         sock.close()
 
 def plot_cwnd():
-    """draw cwnd record plot"""
     if not HAS_MATPLOTLIB:
         return
     global g_window_data
     if not g_window_data:
         return
-    
     try:
         plt.figure(figsize=(12, 6))
-        
         for addr, data in g_window_data.items():
             if not data["time_history"] or not data["cwnd_history"]:
                 continue
-            
             start_time = data["time_history"][0]
             times = [t - start_time for t in data["time_history"]]
             cwnd_values = data["cwnd_history"]
             label = f"{addr[0]}:{addr[1]}"
             plt.plot(times, cwnd_values, marker='o', markersize=3, label=label)
-        
         plt.xlabel('Time (seconds)')
         plt.ylabel('Congestion Window (packets)')
         plt.title('Congestion Window Evolution')

@@ -7,6 +7,7 @@ result*.fragment
 
 # Analysis plot file
 concurrency_analysis.png
+cwnd_record.png
 
 # logs
 logs/
