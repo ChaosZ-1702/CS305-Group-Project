@@ -493,22 +493,12 @@ def peer_run(context: PeerContext) -> None:
     finally:
         sock.close()
 
-
-
-
-
 def plot_cwnd():
-    """
-    绘制拥塞窗口变化曲线
-    """
+    """draw cwnd record plot"""
     if not HAS_MATPLOTLIB:
-        print("matplotlib not installed, skipping plot")
         return
-    
     global g_window_data
-    
     if not g_window_data:
-        print("No congestion window data to plot")
         return
     
     try:
@@ -521,7 +511,6 @@ def plot_cwnd():
             start_time = data["time_history"][0]
             times = [t - start_time for t in data["time_history"]]
             cwnd_values = data["cwnd_history"]
-            
             label = f"{addr[0]}:{addr[1]}"
             plt.plot(times, cwnd_values, marker='o', markersize=3, label=label)
         
@@ -530,16 +519,10 @@ def plot_cwnd():
         plt.title('Congestion Window Evolution')
         plt.legend()
         plt.grid(True)
-        
-        output_path = 'concurrency_analysis.png'
-        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        plt.savefig('cwnd_record.png', dpi=300, bbox_inches='tight')
         plt.close()
-        
-        print(f"Congestion window plot saved to {output_path}")
-    
-    except Exception as e:
-        print(f"Error plotting congestion window: {e}")
-
+    except Exception:
+        pass
 
 def main():
     parser = argparse.ArgumentParser()
@@ -553,7 +536,7 @@ def main():
     
     context = PeerContext(args)
     peer_run(context)
-
+    plot_cwnd()
 
 if __name__ == "__main__":
     main()
