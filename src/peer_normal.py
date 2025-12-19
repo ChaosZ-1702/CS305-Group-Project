@@ -43,8 +43,6 @@ g_sender_info = {}
 g_download_state = {}
 g_upload_state = {}
 g_window_data = {}
-g_active_download_by_peer = {}
-g_pending_downloads_by_peer = {}
 
 def make_packet(packet_type: int, seq_num: int, ack_num: int, payload: bytes) -> bytes:
     header = struct.pack(
@@ -71,77 +69,10 @@ def parse_packet(packet: bytes) -> Tuple:
     
     return (pkt_type, header_len, packet_len, seq_num, ack_num, payload)
 
-def initiate_chunk_download(chunk_hash: str, from_addr: tuple, sock: simsocket.SimSocket) -> None:
-    """Start a GET for one chunk from a specific peer, tracking active download."""
-    g_sender_info[chunk_hash] = from_addr
-    g_active_download_by_peer[from_addr] = chunk_hash
-    g_download_state[chunk_hash] = {
-        "next_seq": 1,
-        "last_ack": 0,
-        "received_data": {},
-        "addr": from_addr,
-        "finished": False,
-        "last_received_time": time.time(),
-    }
-    get_payload = bytes.fromhex(chunk_hash)
-    get_pkt = make_packet(PktType.GET, 0, 0, get_payload)
-    sock.sendto(get_pkt, from_addr)
-
-def start_next_pending(peer_addr: tuple, sock: simsocket.SimSocket) -> None:
-    """If a peer has queued chunks, start the next one now."""
-    pending_list = g_pending_downloads_by_peer.get(peer_addr, [])
-    while pending_list:
-        next_chunk = pending_list.pop(0)
-        if next_chunk in g_received_chunks:
-            continue
-        if next_chunk in g_sender_info:
-            continue
-        initiate_chunk_download(next_chunk, peer_addr, sock)
-        break
-    if not pending_list and peer_addr in g_pending_downloads_by_peer:
-        del g_pending_downloads_by_peer[peer_addr]
-
-def send_pending_packets(sock: simsocket.SimSocket, addr: tuple, state: dict):
-    """send new packets within the congestion window"""
-    chunk_data = state["chunk_data"]
-    total_packets = (len(chunk_data) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
-    
-    window_size = int(state["cwnd"])
-    next_seq = state["last_ack_received"] + 1
-    
-    packets_to_send = []
-    for i in range(window_size):
-        seq_to_send = next_seq + i
-        if seq_to_send <= total_packets and seq_to_send not in state["send_times"]:
-            packets_to_send.append(seq_to_send)
-    
-    for seq_to_send in packets_to_send:
-        left = (seq_to_send - 1) * MAX_PAYLOAD
-        right = min(seq_to_send * MAX_PAYLOAD, len(chunk_data))
-        payload = chunk_data[left:right]
-        
-        data_header = struct.pack(
-            HEADER_FMT,
-            PktType.DATA,
-            HEADER_LEN,
-            socket.htons(HEADER_LEN + len(payload)),
-            socket.htonl(seq_to_send),
-            0,
-        )
-        data_pkt = data_header + payload
-        sock.sendto(data_pkt, addr)
-        
-        state["send_times"][seq_to_send] = time.time()
-        state["last_send_time"] = time.time()
-    
-    state["in_flight"] = len(state["send_times"])
-
 def process_download(sock: simsocket.SimSocket, chunk_file: str, output_file: str) -> None:
     global g_download_chunks, g_context
     
     g_download_chunks = []
-    g_active_download_by_peer.clear()
-    g_pending_downloads_by_peer.clear()
     
     with open(chunk_file, "r") as f:
         lines = f.readlines()
@@ -172,11 +103,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     global g_download_state, g_upload_state, g_window_data
     
     # packet, from_addr = sock.recvfrom(MAX_PAYLOAD + HEADER_LEN)
-    try:
-        packet, from_addr = sock.recvfrom(1440)
-    except socket.error:
-        return
-
+    packet, from_addr = sock.recvfrom(1440)
     parsed = parse_packet(packet)
     if not parsed:
         return
@@ -212,15 +139,21 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         for i in range(num_chunks):
             chunk_hash = chunk_hashes[i * 20:(i + 1) * 20].hex()
             if chunk_hash in g_download_chunks and chunk_hash not in g_received_chunks:
-                if chunk_hash in g_sender_info:
-                    continue
-                active_chunk = g_active_download_by_peer.get(from_addr)
-                if active_chunk and active_chunk != chunk_hash:
-                    pending_list = g_pending_downloads_by_peer.setdefault(from_addr, [])
-                    if chunk_hash not in pending_list:
-                        pending_list.append(chunk_hash)
-                    continue
-                initiate_chunk_download(chunk_hash, from_addr, sock)
+                if chunk_hash not in g_sender_info:
+                    g_sender_info[chunk_hash] = from_addr
+                    
+                    get_payload = bytes.fromhex(chunk_hash)
+                    get_pkt = make_packet(PktType.GET, 0, 0, get_payload)
+                    sock.sendto(get_pkt, from_addr)
+                    
+                    g_download_state[chunk_hash] = {
+                        "next_seq": 1,
+                        "last_ack": 0,
+                        "received_data": {},
+                        "addr": from_addr,
+                        "finished": False,
+                        "last_received_time": time.time(),
+                    }
     
     elif pkt_type == PktType.GET:
         chunk_hash = payload.hex()
@@ -243,9 +176,9 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                     "ssthresh": 64.0,
                     "last_ack_received": 0,
                     "send_times": {},
-                    "timeout": 0.5,
-                    "estimated_rtt": 0.1,
-                    "dev_rtt": 0.05,
+                    "timeout": 1.0,
+                    "estimated_rtt": 0.5,
+                    "dev_rtt": 0.25,
                     "dup_acks": {},
                     "in_flight": 0,
                     "active": True,
@@ -266,9 +199,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             state["dup_acks"] = {}
             state["active"] = True
             state["in_fast_recovery"] = False
-            state["timeout"] = 0.5
             
-            # Send first packet
             first_payload = chunk_data[0:MAX_PAYLOAD]
             data_header = struct.pack(
                 HEADER_FMT,
@@ -315,12 +246,6 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                     if chunk_hash_computed == chunk_hash:
                         g_received_chunks[chunk_hash] = full_data
                         state["finished"] = True
-                        sender = state["addr"]
-                        if g_active_download_by_peer.get(sender) == chunk_hash:
-                            del g_active_download_by_peer[sender]
-                        if chunk_hash in g_sender_info:
-                            del g_sender_info[chunk_hash]
-                        start_next_pending(sender, sock)
                         
                         if len(g_received_chunks) == len(g_download_chunks):
                             output_file = g_context.output_file
@@ -355,7 +280,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 beta = 0.3
                 state["estimated_rtt"] = (1 - alpha) * state["estimated_rtt"] + alpha * sample_rtt
                 state["dev_rtt"] = (1 - beta) * state["dev_rtt"] + beta * abs(sample_rtt - state["estimated_rtt"])
-                state["timeout"] = max(state["estimated_rtt"] + 4 * state["dev_rtt"], 0.2)
+                state["timeout"] = max(state["estimated_rtt"] + 4 * state["dev_rtt"], 0.5)
             
             state["last_ack_received"] = ack_num
             state["dup_acks"] = {}
@@ -375,7 +300,35 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             if ack_num >= total_packets:
                 state["active"] = False
             else:
-                send_pending_packets(sock, from_addr, state)
+                window_size = int(state["cwnd"])
+                next_seq = state["last_ack_received"] + 1
+                
+                packets_to_send = []
+                for i in range(window_size):
+                    seq_to_send = next_seq + i
+                    if seq_to_send <= total_packets and seq_to_send not in state["send_times"]:
+                        packets_to_send.append(seq_to_send)
+                
+                for seq_to_send in packets_to_send:
+                    left = (seq_to_send - 1) * MAX_PAYLOAD
+                    right = min(seq_to_send * MAX_PAYLOAD, len(chunk_data))
+                    payload = chunk_data[left:right]
+                    
+                    data_header = struct.pack(
+                        HEADER_FMT,
+                        PktType.DATA,
+                        HEADER_LEN,
+                        socket.htons(HEADER_LEN + len(payload)),
+                        socket.htonl(seq_to_send),
+                        0,
+                    )
+                    data_pkt = data_header + payload
+                    sock.sendto(data_pkt, from_addr)
+                    
+                    state["send_times"][seq_to_send] = time.time()
+                    state["last_send_time"] = time.time()
+                
+                state["in_flight"] = len(state["send_times"])
             
             if from_addr in g_window_data:
                 g_window_data[from_addr]["cwnd_history"].append(state["cwnd"])
@@ -392,6 +345,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 state["in_fast_recovery"] = True
                 
                 next_seq = ack_num + 1
+                total_packets = (len(chunk_data) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
                 if next_seq <= total_packets:
                     left = (next_seq - 1) * MAX_PAYLOAD
                     right = min(next_seq * MAX_PAYLOAD, len(chunk_data))
@@ -417,22 +371,15 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             
             elif state["dup_acks"][ack_num] > 3:
                 state["cwnd"] += 1.0
-                # send new packets in fast recovery
-                send_pending_packets(sock, from_addr, state)
 
 
 def process_user_input(sock: simsocket.SimSocket) -> None:
-    try:
-        if select.select([sys.stdin], [], [], 0)[0]:
-            command, chunk_file, output_file = input().split()
-            if command == "DOWNLOAD":
-                process_download(sock, chunk_file, output_file)
-            else:
-                pass
-    except EOFError:
+    command, chunk_file, output_file = input().split()
+    if command == "DOWNLOAD":
+        process_download(sock, chunk_file, output_file)
+    else:
         pass
-    except ValueError:
-        pass
+
 
 def peer_run(context: PeerContext) -> None:
     global g_context, g_upload_state
@@ -444,14 +391,10 @@ def peer_run(context: PeerContext) -> None:
     
     try:
         while True:
-            ready_sockets, _, _ = select.select([sock, sys.stdin], [], [], 0.005)
+            ready_sockets, _, _ = select.select([sock, sys.stdin], [], [], 0.1)
             
             if sock in ready_sockets:
-                for _ in range(100):
-                    process_inbound_udp(sock)
-                    r, _, _ = select.select([sock], [], [], 0)
-                    if not r:
-                        break
+                process_inbound_udp(sock)
             
             if sys.stdin in ready_sockets:
                 process_user_input(sock)
@@ -462,6 +405,7 @@ def peer_run(context: PeerContext) -> None:
                     continue
                 
                 chunk_data = state["chunk_data"]
+                total_packets = (len(chunk_data) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
                 timeout = state["timeout"]
                 
                 if state["send_times"]:
@@ -472,7 +416,7 @@ def peer_run(context: PeerContext) -> None:
                         state["ssthresh"] = max(state["cwnd"] / 2.0, 2.0)
                         state["cwnd"] = 1.0
                         state["in_fast_recovery"] = False
-
+                        
                         left = (min_seq - 1) * MAX_PAYLOAD
                         right = min(min_seq * MAX_PAYLOAD, len(chunk_data))
                         payload = chunk_data[left:right]
@@ -494,22 +438,45 @@ def peer_run(context: PeerContext) -> None:
                         if peer_addr in g_window_data:
                             g_window_data[peer_addr]["cwnd_history"].append(state["cwnd"])
                             g_window_data[peer_addr]["time_history"].append(time.time())
-
-                send_pending_packets(sock, peer_addr, state)
-
-            # 检查下载超时,如果超过5秒未收到数据,重新发送WHOHAS
+                
+                elif state["last_ack_received"] < total_packets:
+                    window_size = int(state["cwnd"])
+                    next_seq = state["last_ack_received"] + 1
+                    
+                    packets_to_send = []
+                    for i in range(window_size):
+                        seq_to_send = next_seq + i
+                        if seq_to_send <= total_packets:
+                            packets_to_send.append(seq_to_send)
+                    
+                    for seq_to_send in packets_to_send:
+                        left = (seq_to_send - 1) * MAX_PAYLOAD
+                        right = min(seq_to_send * MAX_PAYLOAD, len(chunk_data))
+                        payload = chunk_data[left:right]
+                        
+                        data_header = struct.pack(
+                            HEADER_FMT,
+                            PktType.DATA,
+                            HEADER_LEN,
+                            socket.htons(HEADER_LEN + len(payload)),
+                            socket.htonl(seq_to_send),
+                            0,
+                        )
+                        data_pkt = data_header + payload
+                        sock.sendto(data_pkt, peer_addr)
+                        
+                        state["send_times"][seq_to_send] = current_time
+                        state["last_send_time"] = current_time
+    
+            
+            # 检查下载超时,如果超过10秒未收到数据,重新发送WHOHAS
             for chunk_hash, state in list(g_download_state.items()):
                 if not state["finished"]:
                     last_time = state.get("last_received_time", 0)
-                    if current_time - last_time > 5.0:
+                    if current_time - last_time > 10.0:
                         # 超时,重新寻找发送者
                         if chunk_hash in g_sender_info:
                             del g_sender_info[chunk_hash]
-                        
-                        sender = state.get("addr")
-                        if sender and g_active_download_by_peer.get(sender) == chunk_hash:
-                            del g_active_download_by_peer[sender]
-                            start_next_pending(sender, sock)
                         
                         # 重置下载状态
                         state["last_received_time"] = current_time
